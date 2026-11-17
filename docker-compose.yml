@@ -1,0 +1,101 @@
+# Dos redes a propósito: backend (api, db, redis) y scanner_net (zap, worker-scans)
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: vulnaudit
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    networks: [backend]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d vulnaudit"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    networks: [backend]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  mailhog:
+    image: mailhog/mailhog
+    ports: ["8025:8025"]
+    networks: [backend]
+    restart: unless-stopped
+
+  zap:
+    image: ghcr.io/zaproxy/zaproxy:stable
+    command: >
+      zap.sh -daemon -host 0.0.0.0 -port 8080
+      -config api.addrs.addr.name=.*
+      -config api.addrs.addr.regex=true
+      -config api.key=${ZAP_API_KEY:?ZAP_API_KEY es obligatorio en .env}
+    networks: [scanner_net]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/8080' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  api:
+    build: .
+    env_file: .env
+    ports: ["8000:8000"]
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    volumes: [reports:/data/reports]
+    networks: [backend]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  worker-default:
+    build: .
+    env_file: .env
+    command: celery -A app.worker.celery_app worker -Q default -c 4 --loglevel=INFO
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    volumes: [reports:/data/reports]
+    networks: [backend]
+    restart: unless-stopped
+
+  worker-scans:
+    build: .
+    env_file: .env
+    command: celery -A app.worker.celery_app worker -Q scans -c 1 --loglevel=INFO
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      zap: {condition: service_healthy}
+    volumes: [reports:/data/reports]
+    networks: [backend, scanner_net]
+    restart: unless-stopped
+
+networks:
+  backend: {}
+  scanner_net:
+    ipam:
+      config: [{subnet: 172.31.200.0/24}]
+
+volumes:
+  pgdata: {}
+  reports: {}

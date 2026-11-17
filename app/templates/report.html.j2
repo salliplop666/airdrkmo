@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8">
+<title>Informe de auditoría – {{ client.name }}</title>
+<style>
+ body{font:13px/1.5 Helvetica,Arial,sans-serif;color:#1a1a1a;margin:32px}
+ h1{font-size:22px;margin:0 0 4px} h2{font-size:16px;border-bottom:1px solid #ccc;padding-bottom:4px;margin-top:28px}
+ table{border-collapse:collapse;width:100%} td,th{border:1px solid #ddd;padding:5px 8px;text-align:left;vertical-align:top}
+ .sev{display:inline-block;padding:1px 8px;border-radius:10px;color:#fff;font-size:11px;font-weight:bold;text-transform:uppercase}
+ .critical{background:#7b1fa2}.high{background:#c62828}.medium{background:#ef6c00}.low{background:#f9a825;color:#222}.info{background:#546e7a}
+ .finding{border:1px solid #ddd;border-radius:4px;padding:10px 14px;margin:12px 0;page-break-inside:avoid}
+ pre{background:#f5f5f5;padding:8px;white-space:pre-wrap;word-break:break-all;font-size:11px}
+ .muted{color:#666}
+</style></head><body>
+<h1>Informe de auditoría de seguridad web</h1>
+<p class="muted">CONFIDENCIAL · Generado {{ generated_at.strftime('%Y-%m-%d %H:%M UTC') }}</p>
+
+<h2>Datos del escaneo</h2>
+<table>
+ <tr><th>Cliente</th><td>{{ client.name }} (contrato {{ client.contract_ref }})</td></tr>
+ <tr><th>Objetivo</th><td>{{ scan.target_url }}</td></tr>
+ <tr><th>Modo</th><td>{{ scan.mode }}</td></tr>
+ <tr><th>Estado</th><td>{{ scan.status }}</td></tr>
+ <tr><th>Inicio / Fin</th><td>{{ scan.started_at }} / {{ scan.finished_at }}</td></tr>
+ <tr><th>IPs resueltas</th><td>{{ (scan.resolved_ips or [])|join(', ') }}</td></tr>
+ <tr><th>Auditor</th><td>{{ auditor.email }}</td></tr>
+ <tr><th>Autorización declarada</th><td>{{ consent.authorization_reference }} · aceptada {{ consent.accepted_at }} (texto v{{ consent.statement_version }}, sha256 {{ consent.statement_sha256[:16] }}…)</td></tr>
+ <tr><th>ID de escaneo</th><td>{{ scan.id }}</td></tr>
+</table>
+
+<h2>Resumen</h2>
+<table><tr>{% for s, n in counts.items() %}<th><span class="sev {{ s }}">{{ s }}</span></th>{% endfor %}</tr>
+<tr>{% for s, n in counts.items() %}<td>{{ n }}</td>{% endfor %}</tr></table>
+
+<h2>Hallazgos ({{ findings|length }})</h2>
+{% for f in findings %}
+<div class="finding">
+ <span class="sev {{ f.severity }}">{{ f.severity }}</span> <strong>{{ f.title }}</strong>
+ <div class="muted">{{ f.method or '' }} {{ f.url }}{% if f.param %} · parámetro: {{ f.param }}{% endif %}{% if f.cwe_id %} · CWE-{{ f.cwe_id }}{% endif %}{% if f.confidence %} · confianza: {{ f.confidence }}{% endif %}</div>
+ {% if f.description %}<p>{{ f.description }}</p>{% endif %}
+ {% if f.solution %}<p><strong>Recomendación:</strong> {{ f.solution }}</p>{% endif %}
+ {% if f.evidence %}<p><strong>Evidencia:</strong></p><pre>{{ f.evidence[:evidence_max] }}</pre>{% endif %}
+</div>
+{% else %}<p>No se detectaron hallazgos.</p>{% endfor %}
+</body></html>
