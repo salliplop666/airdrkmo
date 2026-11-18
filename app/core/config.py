@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     smtp_password: SecretStr | None = None
     smtp_starttls: bool = False
     smtp_from: str = "no-reply@vulnaudit.local"
+    resend_api_key: str | None = None
 
     zap_url: str = "http://zap:8080"
     zap_api_key: SecretStr
