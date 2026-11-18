@@ -1,5 +1,4 @@
 import logging
-
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -34,9 +33,7 @@ if settings.cors_origins:
     )
 
 if prod:
-    app.add_middleware(
-        TrustedHostMiddleware, allowed_hosts=settings.trusted_hosts
-    )
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.trusted_hosts)
 
 
 @app.middleware("http")
@@ -48,24 +45,17 @@ async def security_headers(request: Request, call_next):
     resp.headers.setdefault("Cache-Control", "no-store")
     if prod:
         resp.headers.setdefault(
-            "Strict-Transport-Security",
-            "max-age=63072000; includeSubDomains",
+            "Strict-Transport-Security", "max-age=63072000; includeSubDomains"
         )
     return resp
 
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    log.exception(
-        "Error no manejado en %s %s", request.method, request.url.path
-    )
+    log.exception("Error no manejado en %s %s", request.method, request.url.path)
     return JSONResponse(
         status_code=500,
-        content=(
-            {"detail": "Error interno del servidor"}
-            if prod
-            else {"detail": str(exc)}
-        ),
+        content={"detail": "Error interno del servidor"} if prod else {"detail": str(exc)},
     )
 
 
