@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     zap_disabled_rules: list[int] = []
 
     allowed_ports: list[int] = [80, 443, 8080, 8443]
-    require_target_verification: bool = True
+    require_target_verification: bool = False
     max_active_scans_per_org: int = 3
     reports_dir: str = "/data/reports"
 
@@ -57,7 +57,9 @@ class Settings(BaseSettings):
     @classmethod
     def _fernet_valid(cls, v: SecretStr) -> SecretStr:
         if len(v.get_secret_value()) != 44:
-            raise ValueError("data_encryption_key debe ser una Fernet key válida (44 chars)")
+            raise ValueError(
+                "data_encryption_key debe ser una Fernet key válida (44 chars)"
+            )
         return v
 
     @field_validator("zap_api_key")
