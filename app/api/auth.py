@@ -32,7 +32,6 @@ def _safe_rate_limit(bucket: str, key: str, max_hits: int, window: int) -> None:
     try:
         rate_limit(bucket, key, max_hits, window)
     except Exception as exc:
-        # Redis caído en Render → logueamos y seguimos (no rompe el flujo)
         log.warning("rate_limit indisponible (%s/%s): %s", bucket, key, exc)
 
 
@@ -146,7 +145,6 @@ def register(body: RegisterIn, request: Request, db: Session = Depends(get_db)):
         return GENERIC_REGISTER
 
     except SQLAlchemyError as exc:
-        # La BD no está accesible o las tablas no existen → error claro, no 500 genérico
         db.rollback()
         log.error("Fallo de base de datos en /register: %s", exc)
         raise HTTPException(
@@ -181,8 +179,7 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
     bad = HTTPException(401, "Credenciales incorrectas")
     if user is None:
         verify_password(body.password, DUMMY_HASH)
-        log_event(db, action="auth.login_failed", request=request,
-                  details={"reason": "unknown_user"})
+        log_event(db, action="auth.login_failed", request=request, details={"reason": "unknown_user"})
         db.commit()
         raise bad
 
