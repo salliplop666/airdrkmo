@@ -36,23 +36,31 @@ def _safe_rate_limit(bucket: str, key: str, max_hits: int, window: int) -> None:
 
 
 def _email_async(to: str, subject: str, body: str) -> None:
-    """Envío SÍNCRONO directo por SMTP. Sin Celery, sin Redis. Ideal para Render."""
+    """Envío por Resend API REST. Funciona en Render (sin problemas de IP como Gmail)."""
+    import httpx
+    api_key = getattr(settings, "resend_api_key", None)
+    if not api_key:
+        log.warning("RESEND_API_KEY no configurada. Token de verificación NO enviado.")
+        return
     try:
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = subject
-        msg["From"] = settings.smtp_from
-        msg["To"] = to
-        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=20) as s:
-            if settings.smtp_starttls:
-                s.starttls()
-            if settings.smtp_user:
-                pwd = settings.smtp_password
-                pwd = pwd.get_secret_value() if hasattr(pwd, "get_secret_value") else pwd
-                s.login(settings.smtp_user, pwd)
-            s.send_message(msg)
-        log.info("Correo de verificación enviado a %s", to)
+        resp = httpx.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": "VulnAudit <onboarding@resend.dev>",  # dominio de prueba gratuito
+                "to": [to],
+                "subject": subject,
+                "text": body,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        log.info("Correo enviado a %s via Resend (id=%s)", to, resp.json().get("id"))
     except Exception:
-        log.exception("No se pudo enviar el correo a %s (el token sigue válido en BD)", to)
+        log.exception("Fallo Resend al enviar a %s", to)
 
 
 class RegisterIn(BaseModel):
