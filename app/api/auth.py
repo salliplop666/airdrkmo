@@ -1,9 +1,8 @@
 import logging
-import smtplib
 import uuid
 from datetime import timedelta
-from email.mime.text import MIMEText
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select, update
@@ -28,7 +27,6 @@ MAX_FAILED, LOCK_MINUTES = 10, 15
 
 
 def _safe_rate_limit(bucket: str, key: str, max_hits: int, window: int) -> None:
-    """Rate limit con fallback: si Redis no está disponible, no bloquea el registro."""
     try:
         rate_limit(bucket, key, max_hits, window)
     except Exception as exc:
@@ -37,7 +35,6 @@ def _safe_rate_limit(bucket: str, key: str, max_hits: int, window: int) -> None:
 
 def _email_async(to: str, subject: str, body: str) -> None:
     """Envío síncrono por Resend API. No requiere Celery ni worker."""
-    import httpx
     if not settings.resend_api_key:
         log.warning("RESEND_API_KEY no configurada: correo NO enviado")
         return
@@ -154,10 +151,7 @@ def register(body: RegisterIn, request: Request, db: Session = Depends(get_db)):
     except SQLAlchemyError as exc:
         db.rollback()
         log.error("Fallo de base de datos en /register: %s", exc)
-        raise HTTPException(
-            503,
-            "La base de datos no está disponible. Verifica DATABASE_URL y que el schema.sql esté aplicado.",
-        )
+        raise HTTPException(503, "La base de datos no está disponible.")
 
 
 @router.post("/verify-email")
@@ -173,7 +167,7 @@ def verify_email(body: TokenIn, request: Request, db: Session = Depends(get_db))
     user.email_verified_at, ev.used_at = now, now
     log_event(db, action="user.email_verified", org_id=user.org_id, actor_id=user.id, request=request)
     db.commit()
-    return {"detail": "Email verificado. Ya puedes iniciar sesión."}
+    return {"detail": "Email verificado."}
 
 
 @router.post("/login")
@@ -191,7 +185,7 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
         raise bad
 
     if user.locked_until and user.locked_until > utcnow():
-        raise HTTPException(423, "Cuenta bloqueada temporalmente por intentos fallidos")
+        raise HTTPException(423, "Cuenta bloqueada temporalmente")
 
     if not verify_password(body.password, user.password_hash) or not user.is_active:
         user.failed_login_count += 1
@@ -302,7 +296,6 @@ def refresh(body: RefreshIn, request: Request, db: Session = Depends(get_db)):
             .values(revoked_at=now)
         )
         db.commit()
-        log.warning("Reutilización de refresh token detectada (family=%s)", rt.family_id)
         raise HTTPException(401, "Refresh token inválido")
     user = db.get(User, rt.user_id)
     if rt.expires_at < now or not user or not user.is_active or not user.totp_enabled_at:
