@@ -35,7 +35,7 @@ def _safe_rate_limit(bucket: str, key: str, max_hits: int, window: int) -> None:
 
 def _email_async(to: str, subject: str, body: str) -> None:
     """Envío SÍNCRONO por Resend. No usa Celery ni worker."""
-    if not settings.resend_api_key:
+    if not getattr(settings, "resend_api_key", None):
         log.warning("RESEND_API_KEY no configurada: correo NO enviado a %s", to)
         return
     try:
