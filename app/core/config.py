@@ -57,9 +57,7 @@ class Settings(BaseSettings):
     @classmethod
     def _fernet_valid(cls, v: SecretStr) -> SecretStr:
         if len(v.get_secret_value()) != 44:
-            raise ValueError(
-                "data_encryption_key debe ser una Fernet key válida (44 chars)"
-            )
+            raise ValueError("data_encryption_key debe ser una Fernet key válida (44 chars)")
         return v
 
     @field_validator("zap_api_key")
