@@ -1,11 +1,13 @@
 import logging
+import smtplib
 import uuid
 from datetime import timedelta
+from email.mime.text import MIMEText
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.api.deps import challenge_user, get_db, ip_of
@@ -17,20 +19,41 @@ from app.core.security import (
     new_totp_secret, sha256_hex, totp_uri, utcnow, verify_password, verify_totp,
 )
 from app.db.models import EmailVerification, Invitation, Organization, RefreshToken, User
-from app.worker.tasks import send_email
 
 router = APIRouter(prefix="/auth", tags=["auth"])
-log = logging.getLogger(__name__)  # FIX: era getLogger(name) → NameError
+log = logging.getLogger(__name__)
 
 GENERIC_REGISTER = {"detail": "Si el registro es válido, recibirás un correo para continuar."}
 MAX_FAILED, LOCK_MINUTES = 10, 15
 
 
-def _email_async(to: str, subject: str, body: str) -> None:
+def _safe_rate_limit(bucket: str, key: str, max_hits: int, window: int) -> None:
+    """Rate limit con fallback: si Redis no está disponible, no bloquea el registro."""
     try:
-        send_email.delay(to, subject, body)
+        rate_limit(bucket, key, max_hits, window)
+    except Exception as exc:
+        # Redis caído en Render → logueamos y seguimos (no rompe el flujo)
+        log.warning("rate_limit indisponible (%s/%s): %s", bucket, key, exc)
+
+
+def _email_async(to: str, subject: str, body: str) -> None:
+    """Envío SÍNCRONO directo por SMTP. Sin Celery, sin Redis. Ideal para Render."""
+    try:
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = settings.smtp_from
+        msg["To"] = to
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=20) as s:
+            if settings.smtp_starttls:
+                s.starttls()
+            if settings.smtp_user:
+                pwd = settings.smtp_password
+                pwd = pwd.get_secret_value() if hasattr(pwd, "get_secret_value") else pwd
+                s.login(settings.smtp_user, pwd)
+            s.send_message(msg)
+        log.info("Correo de verificación enviado a %s", to)
     except Exception:
-        log.exception("No se pudo encolar el correo")
+        log.exception("No se pudo enviar el correo a %s (el token sigue válido en BD)", to)
 
 
 class RegisterIn(BaseModel):
@@ -59,72 +82,82 @@ class RefreshIn(BaseModel):
 
 @router.post("/register", status_code=202)
 def register(body: RegisterIn, request: Request, db: Session = Depends(get_db)):
-    rate_limit("register", ip_of(request), 10, 3600)
+    _safe_rate_limit("register", ip_of(request), 10, 3600)
     email, now = body.email.lower(), utcnow()
 
-    if db.scalar(select(User.id).where(User.email == email)):
-        return GENERIC_REGISTER
-
-    invitation = None
-    if body.invite_token:
-        invitation = db.scalar(
-            select(Invitation).where(Invitation.token_hash == sha256_hex(body.invite_token))
-        )
-        if (not invitation or invitation.accepted_at or invitation.expires_at < now
-                or invitation.email != email):
-            raise HTTPException(400, "Invitación inválida o expirada")
-        org_id, role = invitation.org_id, invitation.role
-    else:
-        if not settings.allow_open_registration:
-            raise HTTPException(403, "El registro abierto está deshabilitado; solicita una invitación")
-        if not body.org_name:
-            raise HTTPException(422, "org_name es obligatorio para crear una organización")
-        org = Organization(name=body.org_name)
-        db.add(org)
-        db.flush()
-        org_id, role = org.id, "admin"
-
-    user = User(
-        org_id=org_id, email=email,
-        password_hash=hash_password(body.password), role=role,
-        email_verified_at=now if invitation else None,
-    )
-    db.add(user)
     try:
-        db.flush()
-    except IntegrityError:
-        db.rollback()
+        if db.scalar(select(User.id).where(User.email == email)):
+            return GENERIC_REGISTER
+
+        invitation = None
+        if body.invite_token:
+            invitation = db.scalar(
+                select(Invitation).where(Invitation.token_hash == sha256_hex(body.invite_token))
+            )
+            if (not invitation or invitation.accepted_at or invitation.expires_at < now
+                    or invitation.email != email):
+                raise HTTPException(400, "Invitación inválida o expirada")
+            org_id, role = invitation.org_id, invitation.role
+        else:
+            if not settings.allow_open_registration:
+                raise HTTPException(403, "El registro abierto está deshabilitado")
+            if not body.org_name:
+                raise HTTPException(422, "org_name es obligatorio")
+            org = Organization(name=body.org_name)
+            db.add(org)
+            db.flush()
+            org_id, role = org.id, "admin"
+
+        user = User(
+            org_id=org_id, email=email,
+            password_hash=hash_password(body.password), role=role,
+            email_verified_at=now if invitation else None,
+        )
+        db.add(user)
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            return GENERIC_REGISTER
+
+        raw = None
+        if invitation:
+            invitation.accepted_at = now
+        else:
+            raw, h = new_opaque_token()
+            db.add(EmailVerification(
+                user_id=user.id, token_hash=h,
+                expires_at=now + timedelta(hours=settings.verify_token_hours)
+            ))
+
+        log_event(
+            db, action="user.registered", org_id=org_id, actor_id=user.id,
+            resource_type="user", resource_id=user.id, request=request,
+            details={"role": role, "via_invitation": bool(invitation)}
+        )
+        db.commit()
+
+        if raw:
+            _email_async(
+                email, "Verifica tu cuenta de VulnAudit",
+                f"Verifica tu email con este token (válido {settings.verify_token_hours} h):\n\n{raw}\n\n"
+                f"{settings.base_url}/verify-email?token={raw}",
+            )
         return GENERIC_REGISTER
 
-    raw = None
-    if invitation:
-        invitation.accepted_at = now
-    else:
-        raw, h = new_opaque_token()
-        db.add(EmailVerification(
-            user_id=user.id, token_hash=h,
-            expires_at=now + timedelta(hours=settings.verify_token_hours)
-        ))
-
-    log_event(
-        db, action="user.registered", org_id=org_id, actor_id=user.id,
-        resource_type="user", resource_id=user.id, request=request,
-        details={"role": role, "via_invitation": bool(invitation)}
-    )
-    db.commit()
-
-    if raw:
-        _email_async(
-            email, "Verifica tu cuenta de VulnAudit",
-            f"Verifica tu email con este token (válido {settings.verify_token_hours} h):\n\n{raw}\n\n"
-            f"{settings.base_url}/verify-email?token={raw}",
+    except SQLAlchemyError as exc:
+        # La BD no está accesible o las tablas no existen → error claro, no 500 genérico
+        db.rollback()
+        log.error("Fallo de base de datos en /register: %s", exc)
+        raise HTTPException(
+            503,
+            "La base de datos no está disponible. Verifica DATABASE_URL y que el schema.sql esté aplicado.",
         )
-    return GENERIC_REGISTER
 
 
 @router.post("/verify-email")
 def verify_email(body: TokenIn, request: Request, db: Session = Depends(get_db)):
-    rate_limit("verify", ip_of(request), 20, 3600)
+    _safe_rate_limit("verify", ip_of(request), 20, 3600)
     ev = db.scalar(
         select(EmailVerification).where(EmailVerification.token_hash == sha256_hex(body.token))
     )
@@ -140,10 +173,9 @@ def verify_email(body: TokenIn, request: Request, db: Session = Depends(get_db))
 
 @router.post("/login")
 def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
-    """Paso 1: contraseña. Devuelve un token intermedio; el acceso real exige además TOTP."""
     email, ip = body.email.lower(), ip_of(request)
-    rate_limit("login-ip", ip, 30, 900)
-    rate_limit("login-email", email, 10, 900)
+    _safe_rate_limit("login-ip", ip, 30, 900)
+    _safe_rate_limit("login-email", email, 10, 900)
 
     user = db.scalar(select(User).where(User.email == email))
     bad = HTTPException(401, "Credenciales incorrectas")
@@ -201,7 +233,6 @@ def _issue_tokens(db: Session, user: User, family_id: uuid.UUID | None = None) -
 
 @router.post("/2fa/setup")
 def totp_setup(user: User = Depends(challenge_user("enroll")), db: Session = Depends(get_db)):
-    """Genera el secreto TOTP. El cliente muestra otpauth_uri como QR."""
     if user.totp_enabled_at:
         raise HTTPException(409, "2FA ya está activado")
     secret = new_totp_secret()
@@ -214,7 +245,7 @@ def totp_setup(user: User = Depends(challenge_user("enroll")), db: Session = Dep
 def totp_confirm(body: CodeIn, request: Request,
                  user: User = Depends(challenge_user("enroll")),
                  db: Session = Depends(get_db)):
-    rate_limit("totp", str(user.id), 10, 900)
+    _safe_rate_limit("totp", str(user.id), 10, 900)
     if not user.totp_secret_enc or user.totp_enabled_at:
         raise HTTPException(409, "Inicia la configuración de 2FA primero")
     step = verify_totp(user.totp_secret_enc, body.code, user.totp_last_step)
@@ -234,8 +265,7 @@ def totp_confirm(body: CodeIn, request: Request,
 def totp_verify(body: CodeIn, request: Request,
                 user: User = Depends(challenge_user("mfa")),
                 db: Session = Depends(get_db)):
-    """Paso 2 del login."""
-    rate_limit("totp", str(user.id), 10, 900)
+    _safe_rate_limit("totp", str(user.id), 10, 900)
     step = (
         verify_totp(user.totp_secret_enc or "", body.code, user.totp_last_step)
         if user.totp_secret_enc else None
@@ -254,7 +284,7 @@ def totp_verify(body: CodeIn, request: Request,
 
 @router.post("/refresh")
 def refresh(body: RefreshIn, request: Request, db: Session = Depends(get_db)):
-    rate_limit("refresh", ip_of(request), 60, 900)
+    _safe_rate_limit("refresh", ip_of(request), 60, 900)
     rt = db.scalar(
         select(RefreshToken).where(RefreshToken.token_hash == sha256_hex(body.refresh_token))
     )
