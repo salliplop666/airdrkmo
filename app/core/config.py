@@ -1,6 +1,7 @@
 from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -28,6 +29,7 @@ class Settings(BaseSettings):
     smtp_password: SecretStr | None = None
     smtp_starttls: bool = False
     smtp_from: str = "no-reply@vulnaudit.local"
+
     resend_api_key: str | None = None
 
     zap_url: str = "http://zap:8080"
@@ -64,5 +66,6 @@ class Settings(BaseSettings):
         if len(v.get_secret_value()) < 16:
             raise ValueError("zap_api_key debe tener al menos 16 caracteres")
         return v
+
 
 settings = Settings()
