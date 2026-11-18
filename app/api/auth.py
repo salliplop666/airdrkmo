@@ -20,10 +20,11 @@ from app.db.models import EmailVerification, Invitation, Organization, RefreshTo
 from app.worker.tasks import send_email
 
 router = APIRouter(prefix="/auth", tags=["auth"])
-log = logging.getLogger(__name__)
+log = logging.getLogger(__name__)  # FIX: era getLogger(name) → NameError
 
 GENERIC_REGISTER = {"detail": "Si el registro es válido, recibirás un correo para continuar."}
 MAX_FAILED, LOCK_MINUTES = 10, 15
+
 
 def _email_async(to: str, subject: str, body: str) -> None:
     try:
@@ -31,24 +32,30 @@ def _email_async(to: str, subject: str, body: str) -> None:
     except Exception:
         log.exception("No se pudo encolar el correo")
 
+
 class RegisterIn(BaseModel):
     email: EmailStr
     password: str = Field(min_length=12, max_length=128)
     org_name: str | None = Field(default=None, min_length=2, max_length=120)
     invite_token: str | None = Field(default=None, max_length=200)
 
+
 class LoginIn(BaseModel):
     email: EmailStr
     password: str = Field(max_length=128)
 
+
 class TokenIn(BaseModel):
     token: str = Field(min_length=20, max_length=200)
+
 
 class CodeIn(BaseModel):
     code: str = Field(min_length=6, max_length=6)
 
+
 class RefreshIn(BaseModel):
     refresh_token: str = Field(min_length=20, max_length=200)
+
 
 @router.post("/register", status_code=202)
 def register(body: RegisterIn, request: Request, db: Session = Depends(get_db)):
@@ -60,21 +67,28 @@ def register(body: RegisterIn, request: Request, db: Session = Depends(get_db)):
 
     invitation = None
     if body.invite_token:
-        invitation = db.scalar(select(Invitation).where(Invitation.token_hash == sha256_hex(body.invite_token)))
-        if not invitation or invitation.accepted_at or invitation.expires_at < now or invitation.email != email:
+        invitation = db.scalar(
+            select(Invitation).where(Invitation.token_hash == sha256_hex(body.invite_token))
+        )
+        if (not invitation or invitation.accepted_at or invitation.expires_at < now
+                or invitation.email != email):
             raise HTTPException(400, "Invitación inválida o expirada")
         org_id, role = invitation.org_id, invitation.role
     else:
         if not settings.allow_open_registration:
-            raise HTTPException(403, "El registro abierto está deshabilitado")
+            raise HTTPException(403, "El registro abierto está deshabilitado; solicita una invitación")
         if not body.org_name:
-            raise HTTPException(422, "org_name es obligatorio")
+            raise HTTPException(422, "org_name es obligatorio para crear una organización")
         org = Organization(name=body.org_name)
         db.add(org)
         db.flush()
         org_id, role = org.id, "admin"
 
-    user = User(org_id=org_id, email=email, password_hash=hash_password(body.password), role=role, email_verified_at=now if invitation else None)
+    user = User(
+        org_id=org_id, email=email,
+        password_hash=hash_password(body.password), role=role,
+        email_verified_at=now if invitation else None,
+    )
     db.add(user)
     try:
         db.flush()
@@ -87,19 +101,33 @@ def register(body: RegisterIn, request: Request, db: Session = Depends(get_db)):
         invitation.accepted_at = now
     else:
         raw, h = new_opaque_token()
-        db.add(EmailVerification(user_id=user.id, token_hash=h, expires_at=now + timedelta(hours=settings.verify_token_hours)))
+        db.add(EmailVerification(
+            user_id=user.id, token_hash=h,
+            expires_at=now + timedelta(hours=settings.verify_token_hours)
+        ))
 
-    log_event(db, action="user.registered", org_id=org_id, actor_id=user.id, resource_type="user", resource_id=user.id, request=request, details={"role": role, "via_invitation": bool(invitation)})
+    log_event(
+        db, action="user.registered", org_id=org_id, actor_id=user.id,
+        resource_type="user", resource_id=user.id, request=request,
+        details={"role": role, "via_invitation": bool(invitation)}
+    )
     db.commit()
 
     if raw:
-        _email_async(email, "Verifica tu cuenta de VulnAudit", f"Verifica tu email con este token (válido {settings.verify_token_hours} h):\n\n{raw}\n\n{settings.base_url}/verify-email?token={raw}")
+        _email_async(
+            email, "Verifica tu cuenta de VulnAudit",
+            f"Verifica tu email con este token (válido {settings.verify_token_hours} h):\n\n{raw}\n\n"
+            f"{settings.base_url}/verify-email?token={raw}",
+        )
     return GENERIC_REGISTER
+
 
 @router.post("/verify-email")
 def verify_email(body: TokenIn, request: Request, db: Session = Depends(get_db)):
     rate_limit("verify", ip_of(request), 20, 3600)
-    ev = db.scalar(select(EmailVerification).where(EmailVerification.token_hash == sha256_hex(body.token)))
+    ev = db.scalar(
+        select(EmailVerification).where(EmailVerification.token_hash == sha256_hex(body.token))
+    )
     now = utcnow()
     if not ev or ev.used_at or ev.expires_at < now:
         raise HTTPException(400, "Token inválido o expirado")
@@ -109,8 +137,10 @@ def verify_email(body: TokenIn, request: Request, db: Session = Depends(get_db))
     db.commit()
     return {"detail": "Email verificado. Ya puedes iniciar sesión."}
 
+
 @router.post("/login")
 def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
+    """Paso 1: contraseña. Devuelve un token intermedio; el acceso real exige además TOTP."""
     email, ip = body.email.lower(), ip_of(request)
     rate_limit("login-ip", ip, 30, 900)
     rate_limit("login-email", email, 10, 900)
@@ -119,18 +149,20 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
     bad = HTTPException(401, "Credenciales incorrectas")
     if user is None:
         verify_password(body.password, DUMMY_HASH)
-        log_event(db, action="auth.login_failed", request=request, details={"reason": "unknown_user"})
+        log_event(db, action="auth.login_failed", request=request,
+                  details={"reason": "unknown_user"})
         db.commit()
         raise bad
 
     if user.locked_until and user.locked_until > utcnow():
-        raise HTTPException(423, "Cuenta bloqueada temporalmente")
+        raise HTTPException(423, "Cuenta bloqueada temporalmente por intentos fallidos")
 
     if not verify_password(body.password, user.password_hash) or not user.is_active:
         user.failed_login_count += 1
         if user.failed_login_count >= MAX_FAILED:
             user.locked_until, user.failed_login_count = utcnow() + timedelta(minutes=LOCK_MINUTES), 0
-        log_event(db, action="auth.login_failed", org_id=user.org_id, actor_id=user.id, request=request, details={"reason": "bad_password"})
+        log_event(db, action="auth.login_failed", org_id=user.org_id, actor_id=user.id,
+                  request=request, details={"reason": "bad_password"})
         db.commit()
         raise bad
 
@@ -139,7 +171,8 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
 
     user.failed_login_count = 0
     scope = "mfa" if user.totp_enabled_at else "enroll"
-    log_event(db, action="auth.password_ok", org_id=user.org_id, actor_id=user.id, request=request, details={"next": scope})
+    log_event(db, action="auth.password_ok", org_id=user.org_id, actor_id=user.id,
+              request=request, details={"next": scope})
     db.commit()
 
     return {
@@ -147,19 +180,28 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
         "challenge_token": create_jwt(user.id, scope, settings.challenge_token_minutes),
     }
 
+
 def _issue_tokens(db: Session, user: User, family_id: uuid.UUID | None = None) -> dict:
     raw, h = new_opaque_token()
-    db.add(RefreshToken(user_id=user.id, family_id=family_id or uuid.uuid4(), token_hash=h, expires_at=utcnow() + timedelta(days=settings.refresh_token_days)))
+    db.add(RefreshToken(
+        user_id=user.id, family_id=family_id or uuid.uuid4(), token_hash=h,
+        expires_at=utcnow() + timedelta(days=settings.refresh_token_days)
+    ))
     user.last_login_at = utcnow()
     return {
-        "access_token": create_jwt(user.id, "access", settings.access_token_minutes, org=str(user.org_id), role=user.role),
+        "access_token": create_jwt(
+            user.id, "access", settings.access_token_minutes,
+            org=str(user.org_id), role=user.role
+        ),
         "refresh_token": raw,
         "token_type": "bearer",
         "expires_in": settings.access_token_minutes * 60,
     }
 
+
 @router.post("/2fa/setup")
 def totp_setup(user: User = Depends(challenge_user("enroll")), db: Session = Depends(get_db)):
+    """Genera el secreto TOTP. El cliente muestra otpauth_uri como QR."""
     if user.totp_enabled_at:
         raise HTTPException(409, "2FA ya está activado")
     secret = new_totp_secret()
@@ -167,14 +209,18 @@ def totp_setup(user: User = Depends(challenge_user("enroll")), db: Session = Dep
     db.commit()
     return {"secret": secret, "otpauth_uri": totp_uri(secret, user.email)}
 
+
 @router.post("/2fa/confirm")
-def totp_confirm(body: CodeIn, request: Request, user: User = Depends(challenge_user("enroll")), db: Session = Depends(get_db)):
+def totp_confirm(body: CodeIn, request: Request,
+                 user: User = Depends(challenge_user("enroll")),
+                 db: Session = Depends(get_db)):
     rate_limit("totp", str(user.id), 10, 900)
     if not user.totp_secret_enc or user.totp_enabled_at:
         raise HTTPException(409, "Inicia la configuración de 2FA primero")
     step = verify_totp(user.totp_secret_enc, body.code, user.totp_last_step)
     if step is None:
-        log_event(db, action="auth.totp_failed", org_id=user.org_id, actor_id=user.id, request=request, details={"phase": "enroll"})
+        log_event(db, action="auth.totp_failed", org_id=user.org_id, actor_id=user.id,
+                  request=request, details={"phase": "enroll"})
         db.commit()
         raise HTTPException(401, "Código incorrecto")
     user.totp_enabled_at, user.totp_last_step = utcnow(), step
@@ -183,12 +229,20 @@ def totp_confirm(body: CodeIn, request: Request, user: User = Depends(challenge_
     db.commit()
     return tokens
 
+
 @router.post("/2fa/verify")
-def totp_verify(body: CodeIn, request: Request, user: User = Depends(challenge_user("mfa")), db: Session = Depends(get_db)):
+def totp_verify(body: CodeIn, request: Request,
+                user: User = Depends(challenge_user("mfa")),
+                db: Session = Depends(get_db)):
+    """Paso 2 del login."""
     rate_limit("totp", str(user.id), 10, 900)
-    step = verify_totp(user.totp_secret_enc or "", body.code, user.totp_last_step) if user.totp_secret_enc else None
+    step = (
+        verify_totp(user.totp_secret_enc or "", body.code, user.totp_last_step)
+        if user.totp_secret_enc else None
+    )
     if step is None:
-        log_event(db, action="auth.totp_failed", org_id=user.org_id, actor_id=user.id, request=request, details={"phase": "login"})
+        log_event(db, action="auth.totp_failed", org_id=user.org_id, actor_id=user.id,
+                  request=request, details={"phase": "login"})
         db.commit()
         raise HTTPException(401, "Código incorrecto")
     user.totp_last_step = step
@@ -197,16 +251,24 @@ def totp_verify(body: CodeIn, request: Request, user: User = Depends(challenge_u
     db.commit()
     return tokens
 
+
 @router.post("/refresh")
 def refresh(body: RefreshIn, request: Request, db: Session = Depends(get_db)):
     rate_limit("refresh", ip_of(request), 60, 900)
-    rt = db.scalar(select(RefreshToken).where(RefreshToken.token_hash == sha256_hex(body.refresh_token)))
+    rt = db.scalar(
+        select(RefreshToken).where(RefreshToken.token_hash == sha256_hex(body.refresh_token))
+    )
     if rt is None:
         raise HTTPException(401, "Refresh token inválido")
     now = utcnow()
     if rt.revoked_at:
-        db.execute(update(RefreshToken).where(RefreshToken.family_id == rt.family_id, RefreshToken.revoked_at.is_(None)).values(revoked_at=now))
+        db.execute(
+            update(RefreshToken)
+            .where(RefreshToken.family_id == rt.family_id, RefreshToken.revoked_at.is_(None))
+            .values(revoked_at=now)
+        )
         db.commit()
+        log.warning("Reutilización de refresh token detectada (family=%s)", rt.family_id)
         raise HTTPException(401, "Refresh token inválido")
     user = db.get(User, rt.user_id)
     if rt.expires_at < now or not user or not user.is_active or not user.totp_enabled_at:
@@ -216,9 +278,16 @@ def refresh(body: RefreshIn, request: Request, db: Session = Depends(get_db)):
     db.commit()
     return tokens
 
+
 @router.post("/logout", status_code=204)
 def logout(body: RefreshIn, request: Request, db: Session = Depends(get_db)):
-    rt = db.scalar(select(RefreshToken).where(RefreshToken.token_hash == sha256_hex(body.refresh_token)))
+    rt = db.scalar(
+        select(RefreshToken).where(RefreshToken.token_hash == sha256_hex(body.refresh_token))
+    )
     if rt:
-        db.execute(update(RefreshToken).where(RefreshToken.family_id == rt.family_id, RefreshToken.revoked_at.is_(None)).values(revoked_at=utcnow()))
+        db.execute(
+            update(RefreshToken)
+            .where(RefreshToken.family_id == rt.family_id, RefreshToken.revoked_at.is_(None))
+            .values(revoked_at=utcnow())
+        )
         db.commit()
