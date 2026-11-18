@@ -6,7 +6,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select, update
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import challenge_user, get_db, ip_of
@@ -34,9 +34,9 @@ def _safe_rate_limit(bucket: str, key: str, max_hits: int, window: int) -> None:
 
 
 def _email_async(to: str, subject: str, body: str) -> None:
-    """Envío síncrono por Resend API. No requiere Celery ni worker."""
+    """Envío SÍNCRONO por Resend. No usa Celery ni worker."""
     if not settings.resend_api_key:
-        log.warning("RESEND_API_KEY no configurada: correo NO enviado")
+        log.warning("RESEND_API_KEY no configurada: correo NO enviado a %s", to)
         return
     try:
         r = httpx.post(
@@ -88,70 +88,64 @@ def register(body: RegisterIn, request: Request, db: Session = Depends(get_db)):
     _safe_rate_limit("register", ip_of(request), 10, 3600)
     email, now = body.email.lower(), utcnow()
 
-    try:
-        if db.scalar(select(User.id).where(User.email == email)):
-            return GENERIC_REGISTER
-
-        invitation = None
-        if body.invite_token:
-            invitation = db.scalar(
-                select(Invitation).where(Invitation.token_hash == sha256_hex(body.invite_token))
-            )
-            if (not invitation or invitation.accepted_at or invitation.expires_at < now
-                    or invitation.email != email):
-                raise HTTPException(400, "Invitación inválida o expirada")
-            org_id, role = invitation.org_id, invitation.role
-        else:
-            if not settings.allow_open_registration:
-                raise HTTPException(403, "El registro abierto está deshabilitado")
-            if not body.org_name:
-                raise HTTPException(422, "org_name es obligatorio")
-            org = Organization(name=body.org_name)
-            db.add(org)
-            db.flush()
-            org_id, role = org.id, "admin"
-
-        user = User(
-            org_id=org_id, email=email,
-            password_hash=hash_password(body.password), role=role,
-            email_verified_at=now if invitation else None,
-        )
-        db.add(user)
-        try:
-            db.flush()
-        except IntegrityError:
-            db.rollback()
-            return GENERIC_REGISTER
-
-        raw = None
-        if invitation:
-            invitation.accepted_at = now
-        else:
-            raw, h = new_opaque_token()
-            db.add(EmailVerification(
-                user_id=user.id, token_hash=h,
-                expires_at=now + timedelta(hours=settings.verify_token_hours)
-            ))
-
-        log_event(
-            db, action="user.registered", org_id=org_id, actor_id=user.id,
-            resource_type="user", resource_id=user.id, request=request,
-            details={"role": role, "via_invitation": bool(invitation)}
-        )
-        db.commit()
-
-        if raw:
-            _email_async(
-                email, "Verifica tu cuenta de VulnAudit",
-                f"Verifica tu email con este token (válido {settings.verify_token_hours} h):\n\n{raw}\n\n"
-                f"{settings.base_url}/verify-email?token={raw}",
-            )
+    if db.scalar(select(User.id).where(User.email == email)):
         return GENERIC_REGISTER
 
-    except SQLAlchemyError as exc:
+    invitation = None
+    if body.invite_token:
+        invitation = db.scalar(
+            select(Invitation).where(Invitation.token_hash == sha256_hex(body.invite_token))
+        )
+        if (not invitation or invitation.accepted_at or invitation.expires_at < now
+                or invitation.email != email):
+            raise HTTPException(400, "Invitación inválida o expirada")
+        org_id, role = invitation.org_id, invitation.role
+    else:
+        if not settings.allow_open_registration:
+            raise HTTPException(403, "El registro abierto está deshabilitado")
+        if not body.org_name:
+            raise HTTPException(422, "org_name es obligatorio")
+        org = Organization(name=body.org_name)
+        db.add(org)
+        db.flush()
+        org_id, role = org.id, "admin"
+
+    user = User(
+        org_id=org_id, email=email,
+        password_hash=hash_password(body.password), role=role,
+        email_verified_at=now if invitation else None,
+    )
+    db.add(user)
+    try:
+        db.flush()
+    except IntegrityError:
         db.rollback()
-        log.error("Fallo de base de datos en /register: %s", exc)
-        raise HTTPException(503, "La base de datos no está disponible.")
+        return GENERIC_REGISTER
+
+    raw = None
+    if invitation:
+        invitation.accepted_at = now
+    else:
+        raw, h = new_opaque_token()
+        db.add(EmailVerification(
+            user_id=user.id, token_hash=h,
+            expires_at=now + timedelta(hours=settings.verify_token_hours)
+        ))
+
+    log_event(
+        db, action="user.registered", org_id=org_id, actor_id=user.id,
+        resource_type="user", resource_id=user.id, request=request,
+        details={"role": role, "via_invitation": bool(invitation)}
+    )
+    db.commit()
+
+    if raw:
+        _email_async(
+            email, "Verifica tu cuenta de VulnAudit",
+            f"Verifica tu email con este token (válido {settings.verify_token_hours} h):\n\n{raw}\n\n"
+            f"{settings.base_url}/verify-email?token={raw}",
+        )
+    return GENERIC_REGISTER
 
 
 @router.post("/verify-email")
@@ -167,7 +161,7 @@ def verify_email(body: TokenIn, request: Request, db: Session = Depends(get_db))
     user.email_verified_at, ev.used_at = now, now
     log_event(db, action="user.email_verified", org_id=user.org_id, actor_id=user.id, request=request)
     db.commit()
-    return {"detail": "Email verificado."}
+    return {"detail": "Email verificado. Ya puedes iniciar sesión."}
 
 
 @router.post("/login")
