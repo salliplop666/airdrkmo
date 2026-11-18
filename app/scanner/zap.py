@@ -62,9 +62,7 @@ class ZapScanner:
     def _scope_regex(req: ScanRequest) -> str:
         host = re.escape(req.hostname)
         prefix = r"(?:[a-z0-9-]+\.)*" if req.include_subdomains else ""
-        port_part = (
-            r"(?::80|:443)?" if req.port in (80, 443) else f":{req.port}"
-        )
+        port_part = r"(?::80|:443)?" if req.port in (80, 443) else f":{req.port}"
         return rf"^https?://{prefix}{host}{port_part}(?:/.*)?$"
 
     @staticmethod
@@ -91,9 +89,7 @@ class ZapScanner:
         z = self.zap
         z.call("ascan", "action", "addScanPolicy", scanPolicyName=name)
         z.call("ascan", "action", "disableAllScanners", scanPolicyName=name)
-        scanners = z.call("ascan", "view", "scanners", scanPolicyName=name).get(
-            "scanners", []
-        )
+        scanners = z.call("ascan", "view", "scanners", scanPolicyName=name).get("scanners", [])
         ids = {
             int(s["id"])
             for s in scanners
@@ -103,17 +99,13 @@ class ZapScanner:
         ids -= set(settings.zap_disabled_rules)
         if ids:
             z.call(
-                "ascan",
-                "action",
-                "enableScanners",
+                "ascan", "action", "enableScanners",
                 ids=",".join(map(str, sorted(ids))),
                 scanPolicyName=name,
             )
         return sorted(ids)
 
-    def run(
-        self, req: ScanRequest, should_cancel: Callable[[], bool]
-    ) -> ScanOutcome:
+    def run(self, req: ScanRequest, should_cancel: Callable[[], bool]) -> ScanOutcome:
         ctx, policy = f"ctx-{req.scan_id}", f"pol-{req.scan_id}"
         try:
             return self._run(req, should_cancel, ctx, policy)
@@ -131,23 +123,14 @@ class ZapScanner:
         deadline = time.monotonic() + settings.scan_max_minutes * 60
         scope_re = self._scope_regex(req)
 
-        z.call(
-            "core", "action", "newSession",
-            name=f"scan-{req.scan_id}", overwrite=True,
-        )
+        z.call("core", "action", "newSession", name=f"scan-{req.scan_id}", overwrite=True)
         z.call(
             "core", "action", "setOptionDefaultUserAgent",
             String=f"{settings.scanner_user_agent} scan={req.scan_id}",
         )
         z.call("context", "action", "newContext", contextName=ctx)
-        z.call(
-            "context", "action", "includeInContext",
-            contextName=ctx, regex=scope_re,
-        )
-        z.call(
-            "context", "action", "setContextInScope",
-            contextName=ctx, booleanInScope=True,
-        )
+        z.call("context", "action", "includeInContext", contextName=ctx, regex=scope_re)
+        z.call("context", "action", "setContextInScope", contextName=ctx, booleanInScope=True)
         z.call("pscan", "action", "enableAllScanners")
 
         spider = z.call(
@@ -155,20 +138,13 @@ class ZapScanner:
             url=req.url, contextName=ctx, subtreeOnly=True, maxChildren=200,
         )["scan"]
         ok = self._wait(
-            lambda: int(
-                z.call("spider", "view", "status", scanId=spider)["status"]
-            ),
-            deadline,
-            should_cancel,
+            lambda: int(z.call("spider", "view", "status", scanId=spider)["status"]),
+            deadline, should_cancel,
             lambda: z.call("spider", "action", "stop", scanId=spider),
             "spider",
         )
 
-        while (
-            ok
-            and int(z.call("pscan", "view", "recordsToScan")["recordsToScan"])
-            > 0
-        ):
+        while ok and int(z.call("pscan", "view", "recordsToScan")["recordsToScan"]) > 0:
             if should_cancel() or time.monotonic() > deadline:
                 ok = False
                 break
@@ -177,29 +153,19 @@ class ZapScanner:
         if ok and req.mode == "active_safe":
             enabled = self._build_policy(policy)
             out.stats["active_rules_enabled"] = len(enabled)
-            z.call(
-                "ascan", "action", "setOptionThreadPerHost",
-                Integer=settings.scan_threads_per_host,
-            )
-            z.call(
-                "ascan", "action", "setOptionDelayInMs",
-                Integer=settings.scan_delay_ms,
-            )
+            z.call("ascan", "action", "setOptionThreadPerHost", Integer=settings.scan_threads_per_host)
+            z.call("ascan", "action", "setOptionDelayInMs", Integer=settings.scan_delay_ms)
             z.call(
                 "ascan", "action", "setOptionMaxScanDurationInMins",
                 Integer=max(1, int((deadline - time.monotonic()) // 60)),
             )
             ascan = z.call(
                 "ascan", "action", "scan",
-                url=req.url, recurse=True, inScopeOnly=True,
-                scanPolicyName=policy,
+                url=req.url, recurse=True, inScopeOnly=True, scanPolicyName=policy,
             )["scan"]
             ok = self._wait(
-                lambda: int(
-                    z.call("ascan", "view", "status", scanId=ascan)["status"]
-                ),
-                deadline,
-                should_cancel,
+                lambda: int(z.call("ascan", "view", "status", scanId=ascan)["status"]),
+                deadline, should_cancel,
                 lambda: z.call("ascan", "action", "stop", scanId=ascan),
                 "ascan",
             )
@@ -209,17 +175,13 @@ class ZapScanner:
             out.stats["truncated"] = "max_duration"
 
         out.findings = self._collect(re.compile(scope_re, re.I))
-        out.stats["urls_discovered"] = len(
-            z.call("core", "view", "urls").get("urls", [])
-        )
+        out.stats["urls_discovered"] = len(z.call("core", "view", "urls").get("urls", []))
         return out
 
     def _collect(self, scope: re.Pattern) -> list[FindingDTO]:
         z, findings, start = self.zap, [], 0
         while start < 20000:
-            page = z.call(
-                "alert", "view", "alerts", start=start, count=500
-            ).get("alerts", [])
+            page = z.call("alert", "view", "alerts", start=start, count=500).get("alerts", [])
             for a in page:
                 if not scope.match(a.get("url", "")):
                     continue
@@ -229,24 +191,20 @@ class ZapScanner:
                     cwe_id = cwe if cwe > 0 else None
                 except (ValueError, TypeError):
                     cwe_id = None
-                findings.append(
-                    FindingDTO(
-                        rule_id=str(a.get("pluginId", "")),
-                        title=a.get("alert") or a.get("name", "?"),
-                        severity=sev,
-                        confidence=a.get("confidence"),
-                        url=a.get("url", ""),
-                        method=a.get("method") or None,
-                        param=a.get("param") or None,
-                        cwe_id=cwe_id,
-                        description=a.get("description"),
-                        solution=a.get("solution"),
-                        reference=a.get("reference"),
-                        evidence=self._evidence(
-                            a, enrich=sev != "info" and len(findings) < 300
-                        ),
-                    )
-                )
+                findings.append(FindingDTO(
+                    rule_id=str(a.get("pluginId", "")),
+                    title=a.get("alert") or a.get("name", "?"),
+                    severity=sev,
+                    confidence=a.get("confidence"),
+                    url=a.get("url", ""),
+                    method=a.get("method") or None,
+                    param=a.get("param") or None,
+                    cwe_id=cwe_id,
+                    description=a.get("description"),
+                    solution=a.get("solution"),
+                    reference=a.get("reference"),
+                    evidence=self._evidence(a, enrich=sev != "info" and len(findings) < 300),
+                ))
             if len(page) < 500:
                 break
             start += 500
@@ -254,50 +212,31 @@ class ZapScanner:
 
     def _evidence(self, alert: dict, enrich: bool) -> str | None:
         parts = []
-        for label, key in (
-            ("Evidencia", "evidence"),
-            ("Payload", "attack"),
-            ("Otros", "other"),
-        ):
+        for label, key in (("Evidencia", "evidence"), ("Payload", "attack"), ("Otros", "other")):
             if alert.get(key):
                 parts.append(f"{label}: {alert[key]}")
         if enrich and alert.get("messageId"):
             try:
-                m = self.zap.call(
-                    "core", "view", "message", id=alert["messageId"]
-                )["message"]
+                m = self.zap.call("core", "view", "message", id=alert["messageId"])["message"]
                 parts.append(
                     "--- Petición ---\n"
-                    + _REDACT.sub(
-                        r"\1: [REDACTED]", m.get("requestHeader", "")
-                    )[:1500]
+                    + _REDACT.sub(r"\1: [REDACTED]", m.get("requestHeader", ""))[:1500]
                 )
                 parts.append(
                     "--- Respuesta ---\n"
-                    + _REDACT.sub(
-                        r"\1: [REDACTED]", m.get("responseHeader", "")
-                    )[:1500]
+                    + _REDACT.sub(r"\1: [REDACTED]", m.get("responseHeader", ""))[:1500]
                 )
             except Exception:
-                log.warning(
-                    "No se pudo obtener el mensaje %s", alert.get("messageId")
-                )
+                log.warning("No se pudo obtener el mensaje %s", alert.get("messageId"))
         return "\n".join(parts)[:6000] or None
 
     def _cleanup(self, ctx: str | None, policy: str | None) -> None:
         try:
             if policy:
-                self.zap.call(
-                    "ascan", "action", "removeScanPolicy",
-                    scanPolicyName=policy,
-                )
+                self.zap.call("ascan", "action", "removeScanPolicy", scanPolicyName=policy)
             if ctx:
-                self.zap.call(
-                    "context", "action", "removeContext", contextName=ctx
-                )
-            self.zap.call(
-                "core", "action", "newSession", name="idle", overwrite=True
-            )
+                self.zap.call("context", "action", "removeContext", contextName=ctx)
+            self.zap.call("core", "action", "newSession", name="idle", overwrite=True)
         except Exception:
             log.exception("Fallo limpiando ZAP")
 
