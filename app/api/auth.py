@@ -36,29 +36,28 @@ def _safe_rate_limit(bucket: str, key: str, max_hits: int, window: int) -> None:
 
 
 def _email_async(to: str, subject: str, body: str) -> None:
-    """Envío por Resend API REST. Funciona en Render (sin problemas de IP como Gmail)."""
+    """Envío síncrono por Resend API. No requiere Celery ni worker."""
     import httpx
-    api_key = getattr(settings, "resend_api_key", None)
-    if not api_key:
-        log.warning("RESEND_API_KEY no configurada. Token de verificación NO enviado.")
+    if not settings.resend_api_key:
+        log.warning("RESEND_API_KEY no configurada: correo NO enviado")
         return
     try:
-        resp = httpx.post(
+        r = httpx.post(
             "https://api.resend.com/emails",
             headers={
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {settings.resend_api_key}",
                 "Content-Type": "application/json",
             },
             json={
-                "from": "VulnAudit <onboarding@resend.dev>",  # dominio de prueba gratuito
+                "from": "VulnAudit <onboarding@resend.dev>",
                 "to": [to],
                 "subject": subject,
                 "text": body,
             },
             timeout=15,
         )
-        resp.raise_for_status()
-        log.info("Correo enviado a %s via Resend (id=%s)", to, resp.json().get("id"))
+        r.raise_for_status()
+        log.info("Correo enviado a %s (id=%s)", to, r.json().get("id"))
     except Exception:
         log.exception("Fallo Resend al enviar a %s", to)
 
